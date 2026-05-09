@@ -1,0 +1,27 @@
+# venv / pip
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# runtime artifacts
+logs/
+*.log
+*.pid
+.tmp-*
+
+# weights / archives (these live outside the repo on each host)
+*.tar.gz
+*.safetensors
+models/
+
+# editor
+.vscode/
+.idea/
+.DS_Store
+
+# secrets (just in case)
+.hf-token
+hf.token
+*.key
+*.pem

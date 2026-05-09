@@ -1,0 +1,19 @@
+# Python deps for the MiniCPM-V 4.6 Gradio demo.
+# Assumes PyTorch + CUDA are already installed in the conda env.
+#
+# The transformers used by this demo is the upstream fork at
+# /cache/caitianchi/code/v50/code/new-model-addition-MiniCPM-V-4.6
+# installed in editable mode:
+#   pip install -e /cache/caitianchi/code/v50/code/new-model-addition-MiniCPM-V-4.6 --no-deps
+#
+# These are the *additional* runtime deps on top of a working transformers 5.x env.
+
+gradio>=4.44
+modelscope_studio>=0.4.0
+Pillow>=10.0
+decord>=0.6.0
+huggingface_hub>=1.0
+tokenizers>=0.22.0,<=0.23.0
+regex>=2025.10.22
+mistral_common>=1.11.0
+accelerate>=1.1.0

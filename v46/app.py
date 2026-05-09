@@ -743,7 +743,6 @@ def on_thinking_toggle(thinking_mode, chat_bot, app_session):
     return create_multimodal_input(), copy.deepcopy(INIT_CONV), app_session, None, "", ""
 
 
-
 # ---------- Native Gradio Chatbot helpers ----------
 
 def native_file_path(file_obj) -> str:
@@ -754,11 +753,7 @@ def native_file_path(file_obj) -> str:
             value = file_obj.get(key)
             if isinstance(value, str) and value:
                 return value
-    for attr in ("path", "name", "orig_name", "url"):
-        value = getattr(file_obj, attr, None)
-        if isinstance(value, str) and value:
-            return value
-    return str(file_obj)
+    return _get_path(file_obj)
 
 
 def native_normalize_input(user_input) -> tuple[str, list[str]]:
@@ -785,8 +780,21 @@ def native_file_kind(path: str) -> str | None:
 def native_display_user_messages(text: str, files: list[str]) -> list[dict]:
     messages = []
     for file_path in files:
-        if native_file_kind(file_path) in {"image", "video"}:
+        kind = native_file_kind(file_path)
+        if kind == "image":
             messages.append({"role": "user", "content": {"path": file_path}})
+        elif kind == "video":
+            url = "/gradio_api/file=" + file_path
+            name = html.escape(os.path.basename(file_path))
+            messages.append({
+                "role": "user",
+                "content": (
+                    '<div class="native-video-bubble">'
+                    f'<video controls preload="metadata" src="{url}"></video>'
+                    f'<div class="native-video-name">🎬 {name}</div>'
+                    '</div>'
+                ),
+            })
     if text.strip():
         messages.append({"role": "user", "content": text.strip()})
     elif not messages:
@@ -813,176 +821,292 @@ def native_model_user_content(text: str, files: list[str]) -> tuple[list[dict], 
     return content, images, videos
 
 
-def native_media_allowed(media_counts: dict, new_imgs: int, new_vids: int) -> bool:
-    cur_imgs = int((media_counts or {}).get("images", 0))
-    cur_vids = int((media_counts or {}).get("videos", 0))
-    return not (new_vids + cur_vids > 1 or (new_vids + cur_vids == 1 and cur_imgs + new_imgs > 0))
-
-
-def native_next_media_counts(media_counts: dict, new_imgs: int, new_vids: int) -> dict:
-    return {
-        "images": int((media_counts or {}).get("images", 0)) + new_imgs,
-        "videos": int((media_counts or {}).get("videos", 0)) + new_vids,
-    }
-
-
 def native_empty_input():
     return gr.MultimodalTextbox(value={"text": "", "files": []})
 
 
-def native_generation_messages(model_ctx: list[dict], user_content: list[dict]) -> list[dict]:
-    return [{"role": item["role"], "content": item["content"]} for item in (model_ctx or [])] + [
-        {"role": "user", "content": user_content}
-    ]
+def native_capture_last_turn(app_cfg, source, display_start, display_count,
+                             user_input, media_delta):
+    app_cfg["native_last_turn"] = {
+        "source": source,
+        "display_start": display_start,
+        "display_count": display_count,
+        "user_input": user_input,
+        "media_delta": media_delta,
+    }
 
 
-def native_pick(thinking_mode: bool) -> tuple[str, bool]:
-    variant = pick_variant(bool(thinking_mode))
-    return variant, bool(thinking_mode and variant == "thinking")
+def native_remove_last_turn(chat_messages, app_cfg):
+    last_turn = app_cfg.get("native_last_turn")
+    if not last_turn:
+        return None, chat_messages, app_cfg
+
+    chat_messages = list(chat_messages or [])
+    start = int(last_turn.get("display_start", len(chat_messages)))
+    count = int(last_turn.get("display_count", 0))
+    if count > 0:
+        del chat_messages[start:start + count]
+
+    ctx = list(app_cfg.get("ctx", []))
+    if len(ctx) >= 2:
+        app_cfg["ctx"] = ctx[:-2]
+
+    media_delta = last_turn.get("media_delta", {}) or {}
+    app_cfg["images_cnt"] = max(0, int(app_cfg.get("images_cnt", 0)) - int(media_delta.get("images", 0)))
+    app_cfg["videos_cnt"] = max(0, int(app_cfg.get("videos_cnt", 0)) - int(media_delta.get("videos", 0)))
+    app_cfg["native_last_turn"] = None
+    return last_turn, chat_messages, app_cfg
 
 
-def native_generate_stream_or_once(messages, decode_type, thinking_mode, streaming_mode,
-                                   max_new_tokens, temperature, top_p, top_k, max_frames):
-    sampling = decode_type == "Sampling"
-    if not sampling:
-        streaming_mode = False
-    variant, enable_thinking = native_pick(bool(thinking_mode))
-    print(f"[native] respond variant={variant} enable_thinking={enable_thinking}", flush=True)
-    if streaming_mode:
-        full_text = ""
-        for chunk in generate_stream(
-            messages,
-            enable_thinking=enable_thinking,
-            variant=variant,
-            sampling=sampling,
-            max_new_tokens=max_new_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            top_k=top_k,
-            max_frames=max_frames,
-            stop_control=None,
-        ):
-            full_text += chunk
-            yield full_text, False, variant, sampling
-        yield full_text, True, variant, sampling
-    else:
-        full_text = generate_once(
-            messages,
-            enable_thinking=enable_thinking,
-            variant=variant,
-            sampling=sampling,
-            max_new_tokens=max_new_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            top_k=top_k,
-            max_frames=max_frames,
-        )
-        yield full_text, True, variant, sampling
-
-
-def native_finalize_ctx(model_ctx, user_content, full_text):
-    _, answer_only = parse_thinking(full_text)
-    model_ctx.append({"role": "user", "content": user_content})
-    model_ctx.append({"role": "assistant", "content": [{"type": "text", "text": answer_only}]})
-    return model_ctx
-
-
-def native_chat_respond(user_input, chat_messages, model_ctx, media_counts,
-                        decode_type, thinking_mode, streaming_mode,
+def native_chat_respond(user_input, chat_messages, app_cfg,
+                        params_form, thinking_mode, streaming_mode,
                         max_new_tokens, temperature, top_p, top_k, max_frames):
+    app_cfg.setdefault("session_id", uuid.uuid4().hex[:16])
+    app_cfg["stop_streaming"] = False
+    app_cfg["is_streaming"] = bool(streaming_mode)
+
     text, files = native_normalize_input(user_input)
     user_content, new_imgs, new_vids = native_model_user_content(text, files)
-    if not native_media_allowed(media_counts, new_imgs, new_vids):
+    cur_imgs = app_cfg.get("images_cnt", 0)
+    cur_vids = app_cfg.get("videos_cnt", 0)
+    if new_vids + cur_vids > 1 or (new_vids + cur_vids == 1 and cur_imgs + new_imgs > 0):
         gr.Warning("Only supports single video and no mixing with images.")
-        yield gr.update(), chat_messages, model_ctx, media_counts
+        yield gr.update(), chat_messages, app_cfg, gr.update(visible=False)
         return
+
     chat_messages = list(chat_messages or [])
-    model_ctx = list(model_ctx or [])
+    display_start = len(chat_messages)
     chat_messages.extend(native_display_user_messages(text, files))
     assistant_index = len(chat_messages)
-    chat_messages.append({"role": "assistant", "content": ""})
-    yield native_empty_input(), chat_messages, model_ctx, media_counts
-    messages = native_generation_messages(model_ctx, user_content)
+    chat_messages.append({"role": "assistant", "content": "⏳ Processing…"})
+    yield native_empty_input(), chat_messages, app_cfg, gr.update(visible=True)
+
+    ctx = app_cfg.get("ctx", [])
+    messages = [{"role": item["role"], "content": copy.copy(item["content"])} for item in ctx]
+    messages.append({"role": "user", "content": user_content})
+    sampling = (params_form == "Sampling")
+    if not sampling:
+        streaming_mode = False
+    use_thinking = bool(thinking_mode)
+    variant = pick_variant(use_thinking)
+    enable_thinking = use_thinking and variant == "thinking"
+    app_cfg["current_variant"] = variant
+    print(f"[native] respond variant={variant} enable_thinking={enable_thinking}", flush=True)
+
     try:
-        for full_text, done, variant, sampling in native_generate_stream_or_once(
-            messages, decode_type, thinking_mode, streaming_mode,
-            max_new_tokens, temperature, top_p, top_k, max_frames,
-        ):
-            chat_messages[assistant_index]["content"] = format_response(full_text) if done else full_text
-            yield gr.update(), chat_messages, model_ctx, media_counts
-    except Exception as exc:  # noqa: BLE001
-        print(f"[native] respond error: {exc}", flush=True)
+        full_text = ""
+        if streaming_mode:
+            for chunk in generate_stream(
+                messages, enable_thinking=enable_thinking, variant=variant, sampling=sampling,
+                max_new_tokens=max_new_tokens, temperature=temperature, top_p=top_p, top_k=top_k,
+                max_frames=max_frames,
+                stop_control=app_cfg,
+            ):
+                if app_cfg.get("stop_streaming"):
+                    break
+                full_text += chunk
+                chat_messages[assistant_index]["content"] = full_text
+                yield gr.update(), chat_messages, app_cfg, gr.update()
+        else:
+            full_text = generate_once(
+                messages, enable_thinking=enable_thinking, variant=variant, sampling=sampling,
+                max_new_tokens=max_new_tokens, temperature=temperature, top_p=top_p, top_k=top_k,
+                max_frames=max_frames,
+            )
+    except Exception as e:  # noqa: BLE001
+        print(f"[native] respond error: {e}", flush=True)
         import traceback; traceback.print_exc()
-        chat_messages[assistant_index]["content"] = f"{ERROR_MSG}: {exc}"
-        yield gr.update(), chat_messages, model_ctx, media_counts
-        return
+        full_text = f"{ERROR_MSG}: {e}"
+
+    _, answer_only = parse_thinking(full_text)
     print(f"[native-debug] full_text repr (first 600 chars): {full_text[:600]!r}", flush=True)
-    model_ctx = native_finalize_ctx(model_ctx, user_content, full_text)
-    media_counts = native_next_media_counts(media_counts, new_imgs, new_vids)
-    yield gr.update(), chat_messages, model_ctx, media_counts
+    chat_messages[assistant_index]["content"] = format_response(full_text)
+
+    new_ctx = list(ctx)
+    new_ctx.append({"role": "user", "content": user_content})
+    new_ctx.append({"role": "assistant", "content": [{"type": "text", "text": answer_only}]})
+    app_cfg["ctx"] = new_ctx
+    app_cfg["images_cnt"] = cur_imgs + new_imgs
+    app_cfg["videos_cnt"] = cur_vids + new_vids
+    app_cfg["is_streaming"] = False
+    native_capture_last_turn(
+        app_cfg,
+        "chat",
+        display_start,
+        len(chat_messages) - display_start,
+        {"text": text, "files": files},
+        {"images": new_imgs, "videos": new_vids},
+    )
+
+    yield native_empty_input(), chat_messages, app_cfg, gr.update(visible=False)
 
 
-def native_fewshot_add_example(image_path, user_message, assistant_message, chat_messages, model_ctx, media_counts):
-    if not image_path and not (user_message and user_message.strip()):
+def native_fewshot_add_demonstration(_image, _user_message, _assistant_message,
+                                     chat_messages, app_cfg):
+    app_cfg.setdefault("session_id", uuid.uuid4().hex[:16])
+    files = [_image] if _image else []
+    user_content, new_imgs, new_vids = native_model_user_content(_user_message or "", files)
+    cur_imgs = app_cfg.get("images_cnt", 0)
+    cur_vids = app_cfg.get("videos_cnt", 0)
+    if not files and not (_user_message and _user_message.strip()):
         gr.Warning("Please provide an image and/or a user message.")
-        return None, "", "", chat_messages, model_ctx, media_counts
-    files = [image_path] if image_path else []
-    user_content, new_imgs, new_vids = native_model_user_content(user_message or "", files)
-    if not native_media_allowed(media_counts, new_imgs, new_vids):
+        return _image, _user_message, _assistant_message, chat_messages, app_cfg
+    if new_vids + cur_vids > 1 or (new_vids + cur_vids == 1 and cur_imgs + new_imgs > 0):
         gr.Warning("Only supports single video and no mixing with images.")
-        return image_path, user_message, assistant_message, chat_messages, model_ctx, media_counts
+        return _image, _user_message, _assistant_message, chat_messages, app_cfg
+
     chat_messages = list(chat_messages or [])
-    model_ctx = list(model_ctx or [])
-    chat_messages.extend(native_display_user_messages(user_message or "", files))
-    model_ctx.append({"role": "user", "content": user_content})
-    if assistant_message and assistant_message.strip():
-        chat_messages.append({"role": "assistant", "content": format_response(assistant_message.strip())})
-        model_ctx.append({"role": "assistant", "content": [{"type": "text", "text": assistant_message.strip()}]})
-    media_counts = native_next_media_counts(media_counts, new_imgs, new_vids)
-    return None, "", "", chat_messages, model_ctx, media_counts
+    ctx = list(app_cfg.get("ctx", []))
+    chat_messages.extend(native_display_user_messages(_user_message or "", files))
+    ctx.append({"role": "user", "content": user_content})
+
+    if _assistant_message and _assistant_message.strip():
+        chat_messages.append({"role": "assistant", "content": format_response(_assistant_message.strip())})
+        ctx.append({"role": "assistant", "content": [{"type": "text", "text": _assistant_message.strip()}]})
+
+    app_cfg["ctx"] = ctx
+    app_cfg["images_cnt"] = cur_imgs + new_imgs
+    app_cfg["videos_cnt"] = cur_vids + new_vids
+    app_cfg["native_last_turn"] = None
+    return None, "", "", chat_messages, app_cfg
 
 
-def native_fewshot_generate(image_path, user_message, assistant_message, chat_messages, model_ctx, media_counts,
-                            decode_type, thinking_mode, streaming_mode,
-                            max_new_tokens, temperature, top_p, top_k, max_frames):
-    if not image_path and not (user_message and user_message.strip()):
-        gr.Warning("Please provide an image and/or a question for Few Shot generate.")
-        yield image_path, user_message, "", chat_messages, model_ctx, media_counts
+def native_fewshot_respond(_image, _user_message, _chat_messages, _app_cfg,
+                           params_form, thinking_mode, streaming_mode,
+                           max_new_tokens, temperature, top_p, top_k, max_frames):
+    _app_cfg.setdefault("session_id", uuid.uuid4().hex[:16])
+    _app_cfg["stop_streaming"] = False
+    _app_cfg["is_streaming"] = bool(streaming_mode)
+
+    if not _image and not (_user_message and _user_message.strip()):
+        gr.Warning("Please provide an image and/or a question for Few-Shot generate.")
+        yield _image, _user_message, "", _chat_messages, _app_cfg, gr.update(visible=False)
         return
-    files = [image_path] if image_path else []
-    user_content, new_imgs, new_vids = native_model_user_content(user_message or "", files)
-    if not native_media_allowed(media_counts, new_imgs, new_vids):
+
+    files = [_image] if _image else []
+    user_content, new_imgs, new_vids = native_model_user_content(_user_message or "", files)
+    cur_imgs = _app_cfg.get("images_cnt", 0)
+    cur_vids = _app_cfg.get("videos_cnt", 0)
+    if new_vids + cur_vids > 1 or (new_vids + cur_vids == 1 and cur_imgs + new_imgs > 0):
         gr.Warning("Only supports single video and no mixing with images.")
-        yield image_path, user_message, assistant_message, chat_messages, model_ctx, media_counts
+        yield _image, _user_message, "", _chat_messages, _app_cfg, gr.update(visible=False)
         return
-    chat_messages = list(chat_messages or [])
-    model_ctx = list(model_ctx or [])
-    chat_messages.extend(native_display_user_messages(user_message or "", files))
-    assistant_index = len(chat_messages)
-    chat_messages.append({"role": "assistant", "content": ""})
-    yield None, "", "", chat_messages, model_ctx, media_counts
-    messages = native_generation_messages(model_ctx, user_content)
+
+    _chat_messages = list(_chat_messages or [])
+    display_start = len(_chat_messages)
+    _chat_messages.extend(native_display_user_messages(_user_message or "", files))
+    assistant_index = len(_chat_messages)
+    _chat_messages.append({"role": "assistant", "content": "⏳ Processing…"})
+    yield None, "", "", _chat_messages, _app_cfg, gr.update(visible=True)
+
+    ctx = list(_app_cfg.get("ctx", []))
+    messages = [{"role": item["role"], "content": copy.copy(item["content"])} for item in ctx]
+    messages.append({"role": "user", "content": user_content})
+    sampling = (params_form == "Sampling")
+    if not sampling:
+        streaming_mode = False
+    use_thinking = bool(thinking_mode)
+    variant = pick_variant(use_thinking)
+    enable_thinking = use_thinking and variant == "thinking"
+    _app_cfg["current_variant"] = variant
+    print(f"[native] fewshot variant={variant} enable_thinking={enable_thinking}", flush=True)
+
     try:
-        for full_text, done, variant, sampling in native_generate_stream_or_once(
-            messages, decode_type, thinking_mode, streaming_mode,
+        full_text = ""
+        if streaming_mode:
+            for chunk in generate_stream(
+                messages, enable_thinking=enable_thinking, variant=variant,
+                sampling=sampling,
+                max_new_tokens=max_new_tokens, temperature=temperature,
+                top_p=top_p, top_k=top_k, max_frames=max_frames,
+                stop_control=_app_cfg,
+            ):
+                if _app_cfg.get("stop_streaming"):
+                    break
+                full_text += chunk
+                _chat_messages[assistant_index]["content"] = full_text
+                yield gr.update(), gr.update(), gr.update(), _chat_messages, _app_cfg, gr.update()
+        else:
+            full_text = generate_once(
+                messages, enable_thinking=enable_thinking, variant=variant,
+                sampling=sampling,
+                max_new_tokens=max_new_tokens, temperature=temperature,
+                top_p=top_p, top_k=top_k, max_frames=max_frames,
+            )
+    except Exception as e:  # noqa: BLE001
+        print(f"[native] fewshot_respond error: {e}", flush=True)
+        import traceback; traceback.print_exc()
+        full_text = f"{ERROR_MSG}: {e}"
+
+    _, answer_only = parse_thinking(full_text)
+    print(f"[native-debug] fewshot full_text repr (first 600 chars): {full_text[:600]!r}", flush=True)
+    _chat_messages[assistant_index]["content"] = format_response(full_text)
+
+    new_ctx = list(ctx)
+    new_ctx.append({"role": "user", "content": user_content})
+    new_ctx.append({"role": "assistant", "content": [{"type": "text", "text": answer_only}]})
+    _app_cfg["ctx"] = new_ctx
+    _app_cfg["images_cnt"] = cur_imgs + new_imgs
+    _app_cfg["videos_cnt"] = cur_vids + new_vids
+    _app_cfg["is_streaming"] = False
+    native_capture_last_turn(
+        _app_cfg,
+        "fewshot",
+        display_start,
+        len(_chat_messages) - display_start,
+        {"image": _image, "user_message": _user_message or ""},
+        {"images": new_imgs, "videos": new_vids},
+    )
+    yield None, "", "", _chat_messages, _app_cfg, gr.update(visible=False)
+
+
+def native_regenerate_clicked(chat_messages, app_cfg,
+                              params_form, thinking_mode, streaming_mode,
+                              max_new_tokens, temperature, top_p, top_k, max_frames):
+    last_turn, chat_messages, app_cfg = native_remove_last_turn(chat_messages, app_cfg)
+    if not last_turn:
+        gr.Warning("No question for regeneration.")
+        yield gr.update(), chat_messages, app_cfg, gr.update(visible=False)
+        return
+
+    if last_turn.get("source") == "fewshot":
+        user_input = last_turn.get("user_input", {})
+        for result in native_fewshot_respond(
+            user_input.get("image"), user_input.get("user_message", ""),
+            chat_messages, app_cfg,
+            params_form, thinking_mode, streaming_mode,
             max_new_tokens, temperature, top_p, top_k, max_frames,
         ):
-            chat_messages[assistant_index]["content"] = format_response(full_text) if done else full_text
-            yield gr.update(), gr.update(), gr.update(), chat_messages, model_ctx, media_counts
-    except Exception as exc:  # noqa: BLE001
-        print(f"[native] fewshot error: {exc}", flush=True)
-        import traceback; traceback.print_exc()
-        chat_messages[assistant_index]["content"] = f"{ERROR_MSG}: {exc}"
-        yield gr.update(), gr.update(), gr.update(), chat_messages, model_ctx, media_counts
-        return
-    print(f"[native-debug] fewshot full_text repr (first 600 chars): {full_text[:600]!r}", flush=True)
-    model_ctx = native_finalize_ctx(model_ctx, user_content, full_text)
-    media_counts = native_next_media_counts(media_counts, new_imgs, new_vids)
-    yield gr.update(), gr.update(), gr.update(), chat_messages, model_ctx, media_counts
+            _img, _user, _assistant, _chat, _cfg, _stop = result
+            yield gr.update(), _chat, _cfg, _stop
+    else:
+        user_input = last_turn.get("user_input", {"text": "", "files": []})
+        for result in native_chat_respond(
+            user_input, chat_messages, app_cfg,
+            params_form, thinking_mode, streaming_mode,
+            max_new_tokens, temperature, top_p, top_k, max_frames,
+        ):
+            yield result
 
 
-def native_clear_all():
-    return [], [], {"images": 0, "videos": 0}, native_empty_input(), None, "", ""
+def native_clear_all(txt_message, chat_messages, app_session):
+    app_session["ctx"] = []
+    app_session["images_cnt"] = 0
+    app_session["videos_cnt"] = 0
+    app_session["stop_streaming"] = False
+    app_session["is_streaming"] = False
+    app_session["session_id"] = uuid.uuid4().hex[:16]
+    app_session["native_last_turn"] = None
+    return native_empty_input(), [], app_session, None, "", ""
+
+
+def native_on_thinking_toggle(thinking_mode, chat_messages, app_session):
+    target_variant = pick_variant(bool(thinking_mode))
+    if target_variant != app_session.get("current_variant"):
+        gr.Info(f"Switched to '{target_variant}' model, history cleared.")
+    app_session["current_variant"] = target_variant
+    return native_clear_all(None, chat_messages, app_session)
+
 
 # ---------- UI ----------
 
@@ -1039,6 +1163,16 @@ video { height: auto !important; }
 }
 .thinking-chatbot .message .content p { margin: 0 !important; }
 .thinking-chatbot .message .content { margin: 0; }
+#native-chatbot img,
+#native-chatbot video {
+    max-height: 360px !important;
+    max-width: min(100%, 720px) !important;
+    width: auto !important;
+    object-fit: contain !important;
+    border-radius: 10px;
+}
+#native-chatbot .message-wrap,
+#native-chatbot .message { overflow: visible; }
 """
 
 
@@ -1048,24 +1182,10 @@ def build_ui(model_display_name: str, default_thinking: bool):
         "Switches to the thinking checkpoint and turns on chain-of-thought generation. "
         "Toggling this will clear chat history."
         if len(MODELS) >= 2 else
-        f"Only '{AVAILABLE_VARIANTS[0]}' model is loaded on this server; "
-        "toggling only affects chat-template enable_thinking."
+        "Thinking mode is available when the thinking checkpoint is loaded."
     )
 
-    native_css = CSS + """
-    #native-chatbot img,
-    #native-chatbot video {
-        max-height: 360px !important;
-        max-width: min(100%, 720px) !important;
-        width: auto !important;
-        object-fit: contain !important;
-        border-radius: 10px;
-    }
-    #native-chatbot .message-wrap,
-    #native-chatbot .message { overflow: visible; }
-    """
-
-    with gr.Blocks(css=native_css, title=model_display_name) as demo:
+    with gr.Blocks(css=CSS, title=model_display_name) as demo:
         with MSApplication():
             with gr.Tab(model_display_name):
                 with gr.Row():
@@ -1074,11 +1194,9 @@ def build_ui(model_display_name: str, default_thinking: bool):
                             f"## {model_display_name}\n\n"
                             f"- Loaded variants: **{variants_str}**\n"
                             "- Chat with single / multiple images\n"
-                            "- Chat with a single video\n"
+                            "- Chat with a video\n"
+                            "- Few-shot in-context examples\n"
                             "- Text-only chat\n"
-                            "- Few-Shot in-context examples\n"
-                            "- Streaming output (token-by-token)\n"
-                            "- Thinking mode: switches to the **thinking** checkpoint"
                         )
                         params_form = gr.Radio(
                             choices=["Beam Search", "Sampling"], value="Sampling",
@@ -1089,22 +1207,49 @@ def build_ui(model_display_name: str, default_thinking: bool):
                             label="Thinking Mode (switch to thinking model)",
                             info=thinking_help,
                         )
-                        streaming_mode = gr.Checkbox(value=True, interactive=True, label="Enable Streaming Mode")
-                        max_new_tokens = gr.Slider(64, 16384, value=2048, step=64, label="Max New Tokens")
-                        temperature = gr.Slider(0.01, 2.0, value=0.7, step=0.01, label="Temperature")
-                        top_p = gr.Slider(0.05, 1.0, value=1.0, step=0.05, label="Top-p")
-                        top_k = gr.Slider(0, 200, value=0, step=1, label="Top-k")
-                        max_frames = gr.Slider(
-                            8, 256, value=64, step=8,
-                            label="Max Frames (video sampling)",
-                            info="Max frames to sample from a video. Higher = more temporal detail but slower.",
+                        streaming_mode = gr.Checkbox(
+                            value=True, interactive=True,
+                            label="Enable Streaming Mode",
                         )
+                        max_new_tokens = gr.Slider(
+                            minimum=64, maximum=16384, value=2048, step=64,
+                            label="Max New Tokens",
+                        )
+                        temperature = gr.Slider(
+                            minimum=0.01, maximum=2.0, value=0.7, step=0.01,
+                            label="Temperature",
+                        )
+                        top_p = gr.Slider(
+                            minimum=0.05, maximum=1.0, value=1.0, step=0.05,
+                            label="Top-p",
+                        )
+                        top_k = gr.Slider(
+                            minimum=0, maximum=200, value=0, step=1,
+                            label="Top-k",
+                        )
+                        max_frames = gr.Slider(
+                            minimum=8, maximum=256, value=64, step=8,
+                            label="Max Frames (video sampling)",
+                            info="Max frames to sample from a video. "
+                                 "Higher = more temporal detail but slower.",
+                        )
+                        regenerate_btn = gr.Button("Regenerate")
                         clear_btn = gr.Button("Clear History")
+                        stop_btn = gr.Button("Stop", visible=False)
 
                     with gr.Column(scale=3, min_width=500):
-                        chat_messages = gr.State([])
-                        model_ctx = gr.State([])
-                        media_counts = gr.State({"images": 0, "videos": 0})
+                        session_id = uuid.uuid4().hex[:16]
+                        initial_variant = pick_variant(default_thinking)
+                        app_session = gr.State({
+                            "ctx": [],
+                            "images_cnt": 0,
+                            "videos_cnt": 0,
+                            "stop_streaming": False,
+                            "is_streaming": False,
+                            "session_id": session_id,
+                            "current_variant": initial_variant,
+                            "chat_type": "Chat",
+                        })
                         chat_bot = gr.Chatbot(
                             type="messages",
                             label=f"Chat with {model_display_name}",
@@ -1116,7 +1261,7 @@ def build_ui(model_display_name: str, default_thinking: bool):
                             elem_id="native-chatbot",
                         )
 
-                        with gr.Tab("Chat"):
+                        with gr.Tab("Chat") as chat_tab:
                             txt_message = gr.MultimodalTextbox(
                                 value={"text": "", "files": []},
                                 file_count="multiple",
@@ -1124,18 +1269,27 @@ def build_ui(model_display_name: str, default_thinking: bool):
                                 placeholder="Upload image/video and ask a question...",
                                 submit_btn=True,
                             )
+                            chat_tab_label = gr.Textbox(
+                                value="Chat", interactive=False, visible=False,
+                            )
                             txt_message.submit(
                                 native_chat_respond,
-                                [txt_message, chat_bot, model_ctx, media_counts,
+                                [txt_message, chat_bot, app_session,
                                  params_form, thinking_mode, streaming_mode,
                                  max_new_tokens, temperature, top_p, top_k, max_frames],
-                                [txt_message, chat_bot, model_ctx, media_counts],
+                                [txt_message, chat_bot, app_session, stop_btn],
                             )
 
-                        with gr.Tab("Few Shot"):
+                        with gr.Tab("Few Shot") as fewshot_tab:
+                            fewshot_tab_label = gr.Textbox(
+                                value="Few Shot", interactive=False, visible=False,
+                            )
                             with gr.Row():
                                 with gr.Column(scale=1):
-                                    image_input = gr.Image(type="filepath", sources=["upload"], label="Example Image")
+                                    image_input = gr.Image(
+                                        type="filepath", sources=["upload"],
+                                        label="Example Image",
+                                    )
                                 with gr.Column(scale=3):
                                     user_message = gr.Textbox(
                                         label="User",
@@ -1148,22 +1302,75 @@ def build_ui(model_display_name: str, default_thinking: bool):
                                     with gr.Row():
                                         add_demo_btn = gr.Button("Add Example")
                                         generate_btn = gr.Button("Generate", variant="primary")
+
                             add_demo_btn.click(
-                                native_fewshot_add_example,
-                                [image_input, user_message, assistant_message, chat_bot, model_ctx, media_counts],
-                                [image_input, user_message, assistant_message, chat_bot, model_ctx, media_counts],
+                                native_fewshot_add_demonstration,
+                                [image_input, user_message, assistant_message,
+                                 chat_bot, app_session],
+                                [image_input, user_message, assistant_message,
+                                 chat_bot, app_session],
                             )
                             generate_btn.click(
-                                native_fewshot_generate,
-                                [image_input, user_message, assistant_message, chat_bot, model_ctx, media_counts,
+                                native_fewshot_respond,
+                                [image_input, user_message, chat_bot, app_session,
                                  params_form, thinking_mode, streaming_mode,
                                  max_new_tokens, temperature, top_p, top_k, max_frames],
-                                [image_input, user_message, assistant_message, chat_bot, model_ctx, media_counts],
+                                [image_input, user_message, assistant_message,
+                                 chat_bot, app_session, stop_btn],
                             )
 
+                        # Tab switch events: remember current tab + clear state
+                        chat_tab.select(
+                            select_chat_type,
+                            [chat_tab_label, app_session],
+                            [app_session],
+                        )
+                        chat_tab.select(
+                            native_clear_all,
+                            [txt_message, chat_bot, app_session],
+                            [txt_message, chat_bot, app_session,
+                             image_input, user_message, assistant_message],
+                        )
+                        fewshot_tab.select(
+                            select_chat_type,
+                            [fewshot_tab_label, app_session],
+                            [app_session],
+                        )
+                        fewshot_tab.select(
+                            native_clear_all,
+                            [txt_message, chat_bot, app_session],
+                            [txt_message, chat_bot, app_session,
+                             image_input, user_message, assistant_message],
+                        )
+
+                        params_form.change(
+                            update_streaming_mode_state,
+                            inputs=[params_form],
+                            outputs=[streaming_mode],
+                        )
+                        thinking_mode.change(
+                            native_on_thinking_toggle,
+                            inputs=[thinking_mode, chat_bot, app_session],
+                            outputs=[txt_message, chat_bot, app_session,
+                                     image_input, user_message, assistant_message],
+                        )
+                        regenerate_btn.click(
+                            native_regenerate_clicked,
+                            [chat_bot, app_session,
+                             params_form, thinking_mode, streaming_mode,
+                             max_new_tokens, temperature, top_p, top_k, max_frames],
+                            [txt_message, chat_bot, app_session, stop_btn],
+                        )
                         clear_btn.click(
                             native_clear_all,
-                            outputs=[chat_bot, model_ctx, media_counts, txt_message, image_input, user_message, assistant_message],
+                            [txt_message, chat_bot, app_session],
+                            [txt_message, chat_bot, app_session,
+                             image_input, user_message, assistant_message],
+                        )
+                        stop_btn.click(
+                            stop_clicked,
+                            [app_session],
+                            [app_session, stop_btn],
                         )
 
             with gr.Tab("How to use"):
@@ -1185,6 +1392,7 @@ def build_ui(model_display_name: str, default_thinking: bool):
                             interactive=False, width=400, elem_classes="example",
                         )
     return demo
+
 
 def main():
     parser = argparse.ArgumentParser(

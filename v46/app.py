@@ -42,7 +42,7 @@ PROCESSORS: dict = {}
 AVAILABLE_VARIANTS: list = []   # e.g. ["instruct", "thinking"] or ["instruct"] only
 DEVICE = None
 DTYPE = torch.bfloat16
-DEFAULT_MODEL_NAME = "MiniCPM-V 4.6"
+DEFAULT_MODEL_NAME = "MiniCPM-V 4.6 1B"
 DISABLE_TEXT_ONLY = False  # allow text-only chat
 
 
@@ -1436,7 +1436,7 @@ def main():
     else:
         parser.error("must provide at least one of --instruct_path / --thinking_path / --model_path")
 
-    demo = build_ui(args.model_name, default_thinking=args.default_thinking)
+    demo = build_ui(DEFAULT_MODEL_NAME, default_thinking=args.default_thinking)
     demo.queue(api_open=False).launch(
         share=False,
         show_api=False,

@@ -15,8 +15,11 @@ Supports:
 """
 
 import argparse
+import base64
 import copy
+import hashlib
 import html
+import json
 import os
 import re
 import threading
@@ -26,6 +29,7 @@ import uuid
 import gradio as gr
 import modelscope_studio as mgr
 from modelscope_studio.components.base import Application as MSApplication
+from starlette.middleware import Middleware
 import torch
 from PIL import Image
 from transformers import AutoProcessor, MiniCPMV4_6ForConditionalGeneration, TextIteratorStreamer
@@ -34,6 +38,18 @@ from transformers import AutoProcessor, MiniCPMV4_6ForConditionalGeneration, Tex
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".webp"}
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".mov", ".avi", ".flv", ".wmv", ".webm", ".m4v"}
 ERROR_MSG = "Error, please retry"
+CLIENT_ID_HEADER = "x-v46-client-id"
+HTTP_LOG_FILE = os.environ.get(
+    "V46_HTTP_LOG_FILE",
+    os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "logs", "http_requests.jsonl")),
+)
+RAW_OUTPUT_LOG_FILE = os.environ.get(
+    "V46_RAW_OUTPUT_LOG_FILE",
+    os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "logs", "raw_model_outputs.jsonl")),
+)
+HTTP_LOG_LOCK = threading.Lock()
+RAW_OUTPUT_LOG_LOCK = threading.Lock()
+DEBUG_RESPONSES = os.environ.get("V46_DEBUG_RESPONSES", "0") == "1"
 
 # MODELS / PROCESSORS are dicts keyed by "instruct" / "thinking". In
 # single-model mode only one key exists.
@@ -44,6 +60,219 @@ DEVICE = None
 DTYPE = torch.bfloat16
 DEFAULT_MODEL_NAME = "MiniCPM-V 4.6 1B"
 DISABLE_TEXT_ONLY = False  # allow text-only chat
+
+
+# ---------- HTTP request logging ----------
+
+CLIENT_ID_JS = r"""
+() => {
+  const key = "minicpm_v46_demo_client_id";
+  const header = "x-v46-client-id";
+
+  function newId() {
+    if (window.crypto && window.crypto.randomUUID) {
+      return "local-" + window.crypto.randomUUID();
+    }
+    const rand = Math.random().toString(36).slice(2);
+    return "local-" + Date.now().toString(36) + "-" + rand;
+  }
+
+  let clientId = window.localStorage.getItem(key);
+  if (!clientId) {
+    clientId = newId();
+    window.localStorage.setItem(key, clientId);
+  }
+  window.__minicpmV46ClientId = clientId;
+
+  if (!window.__minicpmV46FetchPatched) {
+    const originalFetch = window.fetch;
+    window.fetch = function(input, init) {
+      const nextInit = init ? Object.assign({}, init) : {};
+      const headers = new Headers(
+        nextInit.headers || (input instanceof Request ? input.headers : undefined)
+      );
+      headers.set(header, clientId);
+      nextInit.headers = headers;
+      return originalFetch.call(this, input, nextInit);
+    };
+
+    const originalOpen = XMLHttpRequest.prototype.open;
+    const originalSend = XMLHttpRequest.prototype.send;
+    XMLHttpRequest.prototype.open = function(method, url) {
+      this.__minicpmV46Url = url;
+      return originalOpen.apply(this, arguments);
+    };
+    XMLHttpRequest.prototype.send = function() {
+      try {
+        this.setRequestHeader(header, clientId);
+      } catch (_) {}
+      return originalSend.apply(this, arguments);
+    };
+
+    window.__minicpmV46FetchPatched = true;
+  }
+}
+"""
+
+
+def _headers_from_asgi(raw_headers) -> list[dict]:
+    headers = []
+    for raw_key, raw_value in raw_headers or []:
+        headers.append({
+            "name": raw_key.decode("latin-1", errors="replace"),
+            "value": raw_value.decode("latin-1", errors="replace"),
+        })
+    return headers
+
+
+def _header_value(headers: list[dict], name: str) -> str:
+    name = name.lower()
+    for header in headers:
+        if header["name"].lower() == name:
+            return header["value"]
+    return ""
+
+
+def _body_text(data: bytes, content_type: str) -> str | None:
+    if not data:
+        return ""
+    lower_type = (content_type or "").lower()
+    text_like = (
+        lower_type.startswith("text/")
+        or "json" in lower_type
+        or "x-www-form-urlencoded" in lower_type
+    )
+    if not text_like:
+        return None
+    return data.decode("utf-8", errors="replace")
+
+
+def _body_record(data: bytes, content_type: str) -> dict:
+    return {
+        "size": len(data),
+        "sha256": hashlib.sha256(data).hexdigest() if data else "",
+        "base64": base64.b64encode(data).decode("ascii") if data else "",
+        "text": _body_text(data, content_type),
+    }
+
+
+def _append_http_log(record: dict) -> None:
+    os.makedirs(os.path.dirname(HTTP_LOG_FILE), exist_ok=True)
+    line = json.dumps(record, ensure_ascii=False, separators=(",", ":"))
+    with HTTP_LOG_LOCK:
+        with open(HTTP_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+
+
+class HTTPRequestLogMiddleware:
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+
+        started = time.time()
+        request_id = uuid.uuid4().hex[:12]
+        scope["v46_request_id"] = request_id
+        status_code = None
+        request_body = bytearray()
+        response_headers = []
+        response_body = bytearray()
+
+        async def receive_wrapper():
+            message = await receive()
+            if message.get("type") == "http.request":
+                chunk = message.get("body", b"") or b""
+                if chunk:
+                    request_body.extend(chunk)
+            return message
+
+        async def send_wrapper(message):
+            nonlocal status_code, response_headers
+            if message.get("type") == "http.response.start":
+                status_code = message.get("status")
+                headers = list(message.get("headers", []))
+                headers.append((b"x-v46-request-id", request_id.encode("ascii")))
+                message["headers"] = headers
+                response_headers = _headers_from_asgi(message.get("headers", []))
+            elif message.get("type") == "http.response.body":
+                chunk = message.get("body", b"") or b""
+                if chunk:
+                    response_body.extend(chunk)
+            await send(message)
+
+        try:
+            await self.app(scope, receive_wrapper, send_wrapper)
+        finally:
+            request_headers = _headers_from_asgi(scope.get("headers", []))
+            client = scope.get("client") or (None, None)
+            request_content_type = _header_value(request_headers, "content-type")
+            response_content_type = _header_value(response_headers, "content-type")
+            record = {
+                "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(started)),
+                "request_id": request_id,
+                "client_id": _header_value(request_headers, CLIENT_ID_HEADER),
+                "client_host": client[0],
+                "client_port": client[1],
+                "method": scope.get("method"),
+                "path": scope.get("path"),
+                "query_string": (scope.get("query_string") or b"").decode("latin-1", errors="replace"),
+                "http_version": scope.get("http_version"),
+                "request_headers": request_headers,
+                "request_body": _body_record(bytes(request_body), request_content_type),
+                "status_code": status_code,
+                "response_headers": response_headers,
+                "response_body": _body_record(bytes(response_body), response_content_type),
+                "duration_ms": round((time.time() - started) * 1000, 2),
+            }
+            try:
+                _append_http_log(record)
+            except Exception as e:  # noqa: BLE001
+                print(f"[http-log] failed to write request log: {e}", flush=True)
+
+
+def http_request_logging_app_kwargs() -> dict:
+    print(f"[http-log] writing requests to {HTTP_LOG_FILE}", flush=True)
+    print(f"[raw-output-log] writing model outputs to {RAW_OUTPUT_LOG_FILE}", flush=True)
+    return {"middleware": [Middleware(HTTPRequestLogMiddleware)]}
+
+
+def _request_log_metadata(request: gr.Request | None) -> dict:
+    if request is None:
+        return {"request_id": "", "client_id": "", "client_host": "", "session_hash": ""}
+
+    headers = dict(getattr(request, "headers", {}) or {})
+    fastapi_request = getattr(request, "request", None)
+    scope = getattr(fastapi_request, "scope", {}) or {}
+    client = getattr(request, "client", None)
+    return {
+        "request_id": scope.get("v46_request_id", ""),
+        "client_id": headers.get(CLIENT_ID_HEADER, ""),
+        "client_host": getattr(client, "host", "") if client else "",
+        "session_hash": getattr(request, "session_hash", "") or "",
+    }
+
+
+def _append_raw_output_log(record: dict) -> None:
+    os.makedirs(os.path.dirname(RAW_OUTPUT_LOG_FILE), exist_ok=True)
+    line = json.dumps(record, ensure_ascii=False, separators=(",", ":"))
+    with RAW_OUTPUT_LOG_LOCK:
+        with open(RAW_OUTPUT_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+
+
+def log_raw_model_output(request: gr.Request | None, **record) -> None:
+    payload = {
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        **_request_log_metadata(request),
+        **record,
+    }
+    try:
+        _append_raw_output_log(payload)
+    except Exception as e:  # noqa: BLE001
+        print(f"[raw-output-log] failed to write raw output log: {e}", flush=True)
 
 
 # ---------- Model loading ----------
@@ -317,20 +546,22 @@ def parse_thinking(full_text: str) -> tuple[str, str]:
 
 
 def normalize_response_text(text: str) -> str:
-    """Convert escaped Markdown line breaks for display only."""
-    if not isinstance(text, str) or "\\n" not in text:
+    """Convert escaped line breaks outside fenced code blocks for display only."""
+    if not isinstance(text, str) or ("\\n" not in text and "\\r" not in text):
         return text
-    escaped_markdown_break = (
-        "\\n\\n" in text
-        or re.search(r"\\n\s*(#{1,6}\s|[-*+]\s|\d+[.)]\s|>)", text)
-    )
-    if not escaped_markdown_break:
-        return text
-    return (
-        text
-        .replace("\\r\\n", "\n")
-        .replace("\\n", "\n")
-        .replace("\\r", "\n")
+
+    def convert_segment(segment: str) -> str:
+        return (
+            segment
+            .replace("\\r\\n", "\n")
+            .replace("\\n", "\n")
+            .replace("\\r", "\n")
+        )
+
+    parts = re.split(r"(```[\s\S]*?```)", text)
+    return "".join(
+        part if part.startswith("```") and part.endswith("```") else convert_segment(part)
+        for part in parts
     )
 
 
@@ -879,7 +1110,8 @@ def native_remove_last_turn(chat_messages, app_cfg):
 
 def native_chat_respond(user_input, chat_messages, app_cfg,
                         params_form, thinking_mode, streaming_mode,
-                        max_new_tokens, temperature, top_p, top_k, max_frames):
+                        max_new_tokens, temperature, top_p, top_k, max_frames,
+                        request: gr.Request):
     app_cfg.setdefault("session_id", uuid.uuid4().hex[:16])
     app_cfg["stop_streaming"] = False
     app_cfg["is_streaming"] = bool(streaming_mode)
@@ -938,8 +1170,29 @@ def native_chat_respond(user_input, chat_messages, app_cfg,
         full_text = f"{ERROR_MSG}: {e}"
 
     _, answer_only = parse_thinking(full_text)
-    print(f"[native-debug] full_text repr (first 600 chars): {full_text[:600]!r}", flush=True)
-    chat_messages[assistant_index]["content"] = format_response(full_text)
+    rendered_text = format_response(full_text)
+    log_raw_model_output(
+        request,
+        source="chat",
+        session_id=app_cfg.get("session_id", ""),
+        variant=variant,
+        enable_thinking=enable_thinking,
+        params_form=params_form,
+        streaming_mode=bool(streaming_mode),
+        max_new_tokens=max_new_tokens,
+        temperature=temperature,
+        top_p=top_p,
+        top_k=top_k,
+        max_frames=max_frames,
+        user_text=text,
+        user_files=files,
+        raw_full_text=full_text,
+        answer_only=answer_only,
+        rendered_text=rendered_text,
+    )
+    if DEBUG_RESPONSES:
+        print(f"[native-debug] full_text repr (first 600 chars): {full_text[:600]!r}", flush=True)
+    chat_messages[assistant_index]["content"] = rendered_text
 
     new_ctx = list(ctx)
     new_ctx.append({"role": "user", "content": user_content})
@@ -992,7 +1245,8 @@ def native_fewshot_add_demonstration(_image, _user_message, _assistant_message,
 
 def native_fewshot_respond(_image, _user_message, _chat_messages, _app_cfg,
                            params_form, thinking_mode, streaming_mode,
-                           max_new_tokens, temperature, top_p, top_k, max_frames):
+                           max_new_tokens, temperature, top_p, top_k, max_frames,
+                           request: gr.Request):
     _app_cfg.setdefault("session_id", uuid.uuid4().hex[:16])
     _app_cfg["stop_streaming"] = False
     _app_cfg["is_streaming"] = bool(streaming_mode)
@@ -1058,8 +1312,29 @@ def native_fewshot_respond(_image, _user_message, _chat_messages, _app_cfg,
         full_text = f"{ERROR_MSG}: {e}"
 
     _, answer_only = parse_thinking(full_text)
-    print(f"[native-debug] fewshot full_text repr (first 600 chars): {full_text[:600]!r}", flush=True)
-    _chat_messages[assistant_index]["content"] = format_response(full_text)
+    rendered_text = format_response(full_text)
+    log_raw_model_output(
+        request,
+        source="fewshot",
+        session_id=_app_cfg.get("session_id", ""),
+        variant=variant,
+        enable_thinking=enable_thinking,
+        params_form=params_form,
+        streaming_mode=bool(streaming_mode),
+        max_new_tokens=max_new_tokens,
+        temperature=temperature,
+        top_p=top_p,
+        top_k=top_k,
+        max_frames=max_frames,
+        user_text=_user_message or "",
+        user_files=[_image] if _image else [],
+        raw_full_text=full_text,
+        answer_only=answer_only,
+        rendered_text=rendered_text,
+    )
+    if DEBUG_RESPONSES:
+        print(f"[native-debug] fewshot full_text repr (first 600 chars): {full_text[:600]!r}", flush=True)
+    _chat_messages[assistant_index]["content"] = rendered_text
 
     new_ctx = list(ctx)
     new_ctx.append({"role": "user", "content": user_content})
@@ -1081,7 +1356,8 @@ def native_fewshot_respond(_image, _user_message, _chat_messages, _app_cfg,
 
 def native_regenerate_clicked(chat_messages, app_cfg,
                               params_form, thinking_mode, streaming_mode,
-                              max_new_tokens, temperature, top_p, top_k, max_frames):
+                              max_new_tokens, temperature, top_p, top_k, max_frames,
+                              request: gr.Request):
     last_turn, chat_messages, app_cfg = native_remove_last_turn(chat_messages, app_cfg)
     if not last_turn:
         gr.Warning("No question for regeneration.")
@@ -1095,6 +1371,7 @@ def native_regenerate_clicked(chat_messages, app_cfg,
             chat_messages, app_cfg,
             params_form, thinking_mode, streaming_mode,
             max_new_tokens, temperature, top_p, top_k, max_frames,
+            request,
         ):
             _img, _user, _assistant, _chat, _cfg, _stop = result
             yield gr.update(), _chat, _cfg, _stop
@@ -1104,6 +1381,7 @@ def native_regenerate_clicked(chat_messages, app_cfg,
             user_input, chat_messages, app_cfg,
             params_form, thinking_mode, streaming_mode,
             max_new_tokens, temperature, top_p, top_k, max_frames,
+            request,
         ):
             yield result
 
@@ -1204,7 +1482,7 @@ def build_ui(model_display_name: str, default_thinking: bool):
         "Thinking mode is available when the thinking checkpoint is loaded."
     )
 
-    with gr.Blocks(css=CSS, title=model_display_name) as demo:
+    with gr.Blocks(css=CSS, title=model_display_name, js=CLIENT_ID_JS) as demo:
         with MSApplication():
             with gr.Tab(model_display_name):
                 with gr.Row():
@@ -1463,6 +1741,7 @@ def main():
         show_api=False,
         server_port=args.port,
         server_name="0.0.0.0",
+        app_kwargs=http_request_logging_app_kwargs(),
     )
 
 

@@ -316,6 +316,24 @@ def parse_thinking(full_text: str) -> tuple[str, str]:
     return thinking, answer
 
 
+def normalize_response_text(text: str) -> str:
+    """Convert escaped Markdown line breaks for display only."""
+    if not isinstance(text, str) or "\\n" not in text:
+        return text
+    escaped_markdown_break = (
+        "\\n\\n" in text
+        or re.search(r"\\n\s*(#{1,6}\s|[-*+]\s|\d+[.)]\s|>)", text)
+    )
+    if not escaped_markdown_break:
+        return text
+    return (
+        text
+        .replace("\\r\\n", "\n")
+        .replace("\\n", "\n")
+        .replace("\\r", "\n")
+    )
+
+
 def format_response(text: str) -> str:
     """Markdown-format the (possibly partial) response.
 
@@ -325,6 +343,7 @@ def format_response(text: str) -> str:
     Thinking is rendered as a blockquote so the user can still distinguish it
     from the final answer.
     """
+    text = normalize_response_text(text)
     thinking, answer = parse_thinking(text)
     if not thinking:
         return answer if answer else text
@@ -905,7 +924,7 @@ def native_chat_respond(user_input, chat_messages, app_cfg,
                 if app_cfg.get("stop_streaming"):
                     break
                 full_text += chunk
-                chat_messages[assistant_index]["content"] = full_text
+                chat_messages[assistant_index]["content"] = normalize_response_text(full_text)
                 yield gr.update(), chat_messages, app_cfg, gr.update()
         else:
             full_text = generate_once(
@@ -1024,7 +1043,7 @@ def native_fewshot_respond(_image, _user_message, _chat_messages, _app_cfg,
                 if _app_cfg.get("stop_streaming"):
                     break
                 full_text += chunk
-                _chat_messages[assistant_index]["content"] = full_text
+                _chat_messages[assistant_index]["content"] = normalize_response_text(full_text)
                 yield gr.update(), gr.update(), gr.update(), _chat_messages, _app_cfg, gr.update()
         else:
             full_text = generate_once(

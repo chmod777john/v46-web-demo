@@ -317,21 +317,32 @@ def parse_thinking(full_text: str) -> tuple[str, str]:
 
 
 def normalize_response_text(text: str) -> str:
-    """Convert escaped Markdown line breaks for display only."""
-    if not isinstance(text, str) or "\\n" not in text:
+    """
+    UI rendering layer: convert literal \\n outside protected regions to real newlines.
+    Protect fenced code blocks, inline code, LaTeX-like commands, and escaped \\n.
+    """
+    if not isinstance(text, str) or "\\" not in text:
         return text
-    escaped_markdown_break = (
-        "\\n\\n" in text
-        or re.search(r"\\n\s*(#{1,6}\s|[-*+]\s|\d+[.)]\s|>)", text)
-    )
-    if not escaped_markdown_break:
-        return text
-    return (
-        text
-        .replace("\\r\\n", "\n")
-        .replace("\\n", "\n")
-        .replace("\\r", "\n")
-    )
+
+    protected = {}
+    counter = [0]
+
+    def _protect(match):
+        key = f"\x00P{counter[0]}\x00"
+        counter[0] += 1
+        protected[key] = match.group(0)
+        return key
+
+    result = text
+    result = re.sub(r"```[\s\S]*?```", _protect, result)
+    result = re.sub(r"`[^`]+`", _protect, result)
+    result = re.sub(r"(?<!\\)\\r\\n", "\n", result)
+    result = re.sub(r"(?<!\\)\\n(?![a-zA-Z])", "\n", result)
+    result = re.sub(r"(?<!\\)\\r(?![a-zA-Z])", "\n", result)
+
+    for key, value in protected.items():
+        result = result.replace(key, value)
+    return result
 
 
 def format_response(text: str) -> str:

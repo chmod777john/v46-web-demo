@@ -841,7 +841,7 @@ def native_model_user_content(text: str, files: list[str]) -> tuple[list[dict], 
 
 
 def native_empty_input():
-    return gr.MultimodalTextbox(value={"text": "", "files": []})
+    return gr.MultimodalTextbox(value={"text": "", "files": []}, label="", show_label=False)
 
 
 def native_capture_last_turn(app_cfg, source, display_start, display_count,
@@ -1285,6 +1285,8 @@ def build_ui(model_display_name: str, default_thinking: bool):
                                 value={"text": "", "files": []},
                                 file_count="multiple",
                                 file_types=["image", "video"],
+                                label="",
+                                show_label=False,
                                 placeholder="Upload image/video and ask a question...",
                                 submit_btn=True,
                             )

@@ -22,6 +22,7 @@ import html
 import json
 import os
 import re
+import shutil
 import threading
 import time
 import uuid
@@ -47,6 +48,11 @@ RAW_OUTPUT_LOG_FILE = os.environ.get(
     "V46_RAW_OUTPUT_LOG_FILE",
     os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "logs", "raw_model_outputs.jsonl")),
 )
+UPLOAD_LOG_DIR = os.environ.get(
+    "V46_UPLOAD_LOG_DIR",
+    os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "logs", "uploads")),
+)
+LOG_ALL_HTTP_REQUESTS = os.environ.get("V46_LOG_ALL_HTTP_REQUESTS", "0") == "1"
 HTTP_LOG_LOCK = threading.Lock()
 RAW_OUTPUT_LOG_LOCK = threading.Lock()
 DEBUG_RESPONSES = os.environ.get("V46_DEBUG_RESPONSES", "0") == "1"
@@ -234,9 +240,12 @@ class HTTPRequestLogMiddleware:
 
 
 def http_request_logging_app_kwargs() -> dict:
-    print(f"[http-log] writing requests to {HTTP_LOG_FILE}", flush=True)
-    print(f"[raw-output-log] writing model outputs to {RAW_OUTPUT_LOG_FILE}", flush=True)
-    return {"middleware": [Middleware(HTTPRequestLogMiddleware)]}
+    print(f"[model-call-log] writing model calls to {RAW_OUTPUT_LOG_FILE}", flush=True)
+    if LOG_ALL_HTTP_REQUESTS:
+        print(f"[http-log] writing all HTTP requests to {HTTP_LOG_FILE}", flush=True)
+        return {"middleware": [Middleware(HTTPRequestLogMiddleware)]}
+    print("[http-log] all-request logging disabled; set V46_LOG_ALL_HTTP_REQUESTS=1 to enable", flush=True)
+    return {}
 
 
 def _request_log_metadata(request: gr.Request | None) -> dict:
@@ -263,11 +272,27 @@ def _append_raw_output_log(record: dict) -> None:
             f.write(line + "\n")
 
 
+def _json_safe_for_log(value):
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if isinstance(value, dict):
+        return {str(k): _json_safe_for_log(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe_for_log(v) for v in value]
+    if isinstance(value, Image.Image):
+        return {"type": "PIL.Image", "mode": value.mode, "size": list(value.size)}
+    if hasattr(value, "__fspath__"):
+        return os.fspath(value)
+    return repr(value)
+
+
 def log_raw_model_output(request: gr.Request | None, **record) -> None:
+    safe_record = {key: _json_safe_for_log(value) for key, value in record.items()}
     payload = {
         "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "call_id": uuid.uuid4().hex[:12],
         **_request_log_metadata(request),
-        **record,
+        **safe_record,
     }
     try:
         _append_raw_output_log(payload)
@@ -1015,6 +1040,40 @@ def native_file_path(file_obj) -> str:
     return _get_path(file_obj)
 
 
+def _safe_upload_name(path: str) -> str:
+    name = os.path.basename(path) or "upload.bin"
+    name = re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("._")
+    return name[:120] or "upload.bin"
+
+
+def persist_uploaded_files(files: list[str], session_id: str) -> list[str]:
+    """Copy Gradio temp uploads into the project log directory before inference."""
+    if not files:
+        return []
+
+    session_dir = re.sub(r"[^A-Za-z0-9._-]+", "_", session_id or "session").strip("._")
+    dest_dir = os.path.join(UPLOAD_LOG_DIR, session_dir or "session")
+    os.makedirs(dest_dir, exist_ok=True)
+
+    persisted = []
+    upload_root = os.path.abspath(UPLOAD_LOG_DIR)
+    for src in files:
+        src_path = os.path.abspath(src)
+        if src_path.startswith(upload_root + os.sep):
+            persisted.append(src_path)
+            continue
+        if not os.path.isfile(src_path):
+            persisted.append(src)
+            continue
+
+        base = _safe_upload_name(src_path)
+        stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+        dest = os.path.join(dest_dir, f"{stamp}-{uuid.uuid4().hex[:8]}-{base}")
+        shutil.copy2(src_path, dest)
+        persisted.append(dest)
+    return persisted
+
+
 def native_normalize_input(user_input) -> tuple[str, list[str]]:
     if not user_input:
         return "", []
@@ -1126,6 +1185,7 @@ def native_chat_respond(user_input, chat_messages, app_cfg,
     app_cfg["is_streaming"] = bool(streaming_mode)
 
     text, files = native_normalize_input(user_input)
+    files = persist_uploaded_files(files, app_cfg.get("session_id", ""))
     user_content, new_imgs, new_vids = native_model_user_content(text, files)
     cur_imgs = app_cfg.get("images_cnt", 0)
     cur_vids = app_cfg.get("videos_cnt", 0)
@@ -1195,6 +1255,8 @@ def native_chat_respond(user_input, chat_messages, app_cfg,
         max_frames=max_frames,
         user_text=text,
         user_files=files,
+        model_messages=messages,
+        context_turns=len(ctx),
         raw_full_text=full_text,
         answer_only=answer_only,
         rendered_text=rendered_text,
@@ -1226,6 +1288,7 @@ def native_fewshot_add_demonstration(_image, _user_message, _assistant_message,
                                      chat_messages, app_cfg):
     app_cfg.setdefault("session_id", uuid.uuid4().hex[:16])
     files = [_image] if _image else []
+    files = persist_uploaded_files(files, app_cfg.get("session_id", ""))
     user_content, new_imgs, new_vids = native_model_user_content(_user_message or "", files)
     cur_imgs = app_cfg.get("images_cnt", 0)
     cur_vids = app_cfg.get("videos_cnt", 0)
@@ -1266,6 +1329,7 @@ def native_fewshot_respond(_image, _user_message, _chat_messages, _app_cfg,
         return
 
     files = [_image] if _image else []
+    files = persist_uploaded_files(files, _app_cfg.get("session_id", ""))
     user_content, new_imgs, new_vids = native_model_user_content(_user_message or "", files)
     cur_imgs = _app_cfg.get("images_cnt", 0)
     cur_vids = _app_cfg.get("videos_cnt", 0)
@@ -1336,7 +1400,9 @@ def native_fewshot_respond(_image, _user_message, _chat_messages, _app_cfg,
         top_k=top_k,
         max_frames=max_frames,
         user_text=_user_message or "",
-        user_files=[_image] if _image else [],
+        user_files=files,
+        model_messages=messages,
+        context_turns=len(ctx),
         raw_full_text=full_text,
         answer_only=answer_only,
         rendered_text=rendered_text,
@@ -1750,6 +1816,7 @@ def main():
         show_api=False,
         server_port=args.port,
         server_name="0.0.0.0",
+        allowed_paths=[UPLOAD_LOG_DIR],
         app_kwargs=http_request_logging_app_kwargs(),
     )
 

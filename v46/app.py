@@ -639,8 +639,9 @@ def parse_thinking(full_text: str) -> tuple[str, str]:
 
 def normalize_response_text(text: str) -> str:
     """
-    UI rendering layer: convert literal \\n outside protected regions to real newlines.
-    Protect fenced code blocks, inline code, LaTeX-like commands, and escaped \\n.
+    UI rendering layer: convert literal \\n to real newlines when they are used
+    as Markdown line breaks, while preserving inline code, LaTeX-like commands,
+    and escaped \\n.
     """
     if not isinstance(text, str) or "\\" not in text:
         return text
@@ -648,18 +649,33 @@ def normalize_response_text(text: str) -> str:
     protected = {}
     counter = [0]
 
+    def _convert_literal_breaks(value: str) -> str:
+        def _replace_break_run(match):
+            tokens = re.findall(r"\\r\\n|\\n|\\r", match.group(0))
+            return "\n" * len(tokens)
+
+        value = re.sub(r"(?<!\\)(?:\\r\\n|\\n|\\r){2,}", _replace_break_run, value)
+        value = re.sub(r"(?<!\\)\\r\\n", "\n", value)
+        value = re.sub(r"(?<!\\)\\n(?![a-zA-Z])", "\n", value)
+        value = re.sub(r"(?<!\\)\\r(?![a-zA-Z])", "\n", value)
+        return value
+
     def _protect(match):
         key = f"\x00P{counter[0]}\x00"
         counter[0] += 1
         protected[key] = match.group(0)
         return key
 
+    def _normalize_and_protect_fenced_block(match):
+        key = f"\x00P{counter[0]}\x00"
+        counter[0] += 1
+        protected[key] = _convert_literal_breaks(match.group(0))
+        return key
+
     result = text
-    result = re.sub(r"```[\s\S]*?```", _protect, result)
+    result = re.sub(r"```[\s\S]*?```", _normalize_and_protect_fenced_block, result)
     result = re.sub(r"`[^`]+`", _protect, result)
-    result = re.sub(r"(?<!\\)\\r\\n", "\n", result)
-    result = re.sub(r"(?<!\\)\\n(?![a-zA-Z])", "\n", result)
-    result = re.sub(r"(?<!\\)\\r(?![a-zA-Z])", "\n", result)
+    result = _convert_literal_breaks(result)
 
     for key, value in protected.items():
         result = result.replace(key, value)

@@ -40,17 +40,20 @@ IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".webp"}
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".mov", ".avi", ".flv", ".wmv", ".webm", ".m4v"}
 ERROR_MSG = "Error, please retry"
 CLIENT_ID_HEADER = "x-v46-client-id"
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+DEFAULT_STORAGE_ROOT = "/data" if os.path.isdir("/data") else os.path.join(PROJECT_ROOT, "logs")
+LOG_DIR = os.environ.get("V46_LOG_DIR", os.path.join(DEFAULT_STORAGE_ROOT, "logs"))
 HTTP_LOG_FILE = os.environ.get(
     "V46_HTTP_LOG_FILE",
-    os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "logs", "http_requests.jsonl")),
+    os.path.join(LOG_DIR, "http_requests.jsonl"),
 )
 RAW_OUTPUT_LOG_FILE = os.environ.get(
     "V46_RAW_OUTPUT_LOG_FILE",
-    os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "logs", "raw_model_outputs.jsonl")),
+    os.path.join(LOG_DIR, "raw_model_outputs.jsonl"),
 )
 UPLOAD_LOG_DIR = os.environ.get(
     "V46_UPLOAD_LOG_DIR",
-    os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "logs", "uploads")),
+    os.path.join(DEFAULT_STORAGE_ROOT, "uploads"),
 )
 LOG_ALL_HTTP_REQUESTS = os.environ.get("V46_LOG_ALL_HTTP_REQUESTS", "0") == "1"
 HTTP_LOG_LOCK = threading.Lock()
@@ -66,6 +69,12 @@ DEVICE = None
 DTYPE = torch.bfloat16
 DEFAULT_MODEL_NAME = "MiniCPM-V 4.6 1B"
 DISABLE_TEXT_ONLY = False  # allow text-only chat
+MODEL_LOAD_LOCK = threading.Lock()
+LAZY_MODEL_CONFIG = {
+    "instruct_path": None,
+    "thinking_path": None,
+    "device": "cuda",
+}
 
 
 # ---------- HTTP request logging ----------
@@ -315,6 +324,11 @@ def _load_one(path: str, device: str):
     return model, processor
 
 
+def _register_available_variant(variant: str) -> None:
+    if variant not in AVAILABLE_VARIANTS:
+        AVAILABLE_VARIANTS.append(variant)
+
+
 def load_models(instruct_path: str | None = None,
                 thinking_path: str | None = None,
                 device: str = "cuda") -> None:
@@ -325,25 +339,75 @@ def load_models(instruct_path: str | None = None,
         raise ValueError("At least one of instruct_path / thinking_path must be set")
 
     if instruct_path:
+        _register_available_variant("instruct")
+    if thinking_path:
+        _register_available_variant("thinking")
+
+    if instruct_path and "instruct" not in MODELS:
         m, p = _load_one(instruct_path, device)
         MODELS["instruct"] = m
         PROCESSORS["instruct"] = p
-        AVAILABLE_VARIANTS.append("instruct")
 
-    if thinking_path:
+    if thinking_path and "thinking" not in MODELS:
         m, p = _load_one(thinking_path, device)
         MODELS["thinking"] = m
         PROCESSORS["thinking"] = p
-        AVAILABLE_VARIANTS.append("thinking")
 
     print(f"[v46] Loaded variants: {AVAILABLE_VARIANTS}")
 
 
+def configure_lazy_models(instruct_path: str | None = None,
+                          thinking_path: str | None = None,
+                          device: str = "cuda") -> None:
+    """Register model paths without loading them until a request enters GPU scope."""
+    global DEVICE
+    if not instruct_path and not thinking_path:
+        raise ValueError("At least one lazy model path must be set")
+    LAZY_MODEL_CONFIG["instruct_path"] = instruct_path
+    LAZY_MODEL_CONFIG["thinking_path"] = thinking_path
+    LAZY_MODEL_CONFIG["device"] = device
+    DEVICE = device
+    if instruct_path:
+        _register_available_variant("instruct")
+    if thinking_path:
+        _register_available_variant("thinking")
+    print(f"[v46] Lazy model config: variants={AVAILABLE_VARIANTS}, device={device}", flush=True)
+
+
+def ensure_models_loaded(variant: str | None = None) -> None:
+    """Load the requested lazy model variant if it is not already resident."""
+    if variant and variant in MODELS:
+        return
+    if not variant and MODELS:
+        return
+
+    with MODEL_LOAD_LOCK:
+        if variant and variant in MODELS:
+            return
+        if not variant and MODELS:
+            return
+
+        instruct_path = LAZY_MODEL_CONFIG.get("instruct_path")
+        thinking_path = LAZY_MODEL_CONFIG.get("thinking_path")
+        device = LAZY_MODEL_CONFIG.get("device") or DEVICE or "cuda"
+        if variant == "thinking":
+            if not thinking_path:
+                raise RuntimeError("Thinking model was requested but no thinking_path is configured")
+            load_models(thinking_path=thinking_path, device=device)
+            return
+        if variant == "instruct":
+            if not instruct_path:
+                raise RuntimeError("Instruct model was requested but no instruct_path is configured")
+            load_models(instruct_path=instruct_path, device=device)
+            return
+        load_models(instruct_path=instruct_path, thinking_path=thinking_path, device=device)
+
+
 def pick_variant(use_thinking: bool) -> str:
     """Map the UI checkbox to an actual available variant."""
-    if use_thinking and "thinking" in MODELS:
+    if use_thinking and ("thinking" in MODELS or LAZY_MODEL_CONFIG.get("thinking_path")):
         return "thinking"
-    if "instruct" in MODELS:
+    if "instruct" in MODELS or LAZY_MODEL_CONFIG.get("instruct_path"):
         return "instruct"
     # Fallback: only one is loaded
     return AVAILABLE_VARIANTS[0]
@@ -452,6 +516,7 @@ def build_messages(ctx: list[dict], user_question) -> tuple[list[dict], int, int
 
 def _prepare_inputs(messages, enable_thinking: bool, variant: str,
                     max_frames: int | None = None):
+    ensure_models_loaded(variant)
     model = MODELS[variant]
     processor = PROCESSORS[variant]
     # Official transformers expects processor kwargs under `processor_kwargs`,
@@ -510,6 +575,7 @@ def generate_stream(messages, enable_thinking: bool, variant: str, sampling: boo
                     max_frames: int | None = None,
                     stop_control: dict | None = None):
     """Yield decoded text chunks (newly added characters) as the model generates."""
+    ensure_models_loaded(variant)
     model = MODELS[variant]
     processor = PROCESSORS[variant]
     inputs = _prepare_inputs(messages, enable_thinking, variant, max_frames=max_frames)
@@ -544,6 +610,7 @@ def generate_stream(messages, enable_thinking: bool, variant: str, sampling: boo
 def generate_once(messages, enable_thinking: bool, variant: str, sampling: bool,
                   max_new_tokens: int, temperature: float, top_p: float, top_k: int,
                   max_frames: int | None = None) -> str:
+    ensure_models_loaded(variant)
     model = MODELS[variant]
     processor = PROCESSORS[variant]
     inputs = _prepare_inputs(messages, enable_thinking, variant, max_frames=max_frames)
@@ -1046,6 +1113,41 @@ def _safe_upload_name(path: str) -> str:
     return name[:120] or "upload.bin"
 
 
+def _infer_upload_extension(path: str) -> str:
+    ext = os.path.splitext(path)[1].lower()
+    if ext in IMAGE_EXTENSIONS or ext in VIDEO_EXTENSIONS:
+        return ext
+
+    try:
+        with Image.open(path) as img:
+            fmt = (img.format or "").lower()
+        image_ext = {
+            "jpeg": ".jpg",
+            "jpg": ".jpg",
+            "png": ".png",
+            "gif": ".gif",
+            "webp": ".webp",
+            "bmp": ".bmp",
+            "tiff": ".tiff",
+        }.get(fmt)
+        if image_ext:
+            return image_ext
+    except Exception:
+        pass
+
+    try:
+        with open(path, "rb") as f:
+            header = f.read(32)
+        if len(header) >= 12 and header[4:8] == b"ftyp":
+            return ".mp4"
+        if header.startswith(b"\x1aE\xdf\xa3"):
+            return ".webm"
+    except Exception:
+        pass
+
+    return ""
+
+
 def persist_uploaded_files(files: list[str], session_id: str) -> list[str]:
     """Copy Gradio temp uploads into the project log directory before inference."""
     if not files:
@@ -1067,6 +1169,9 @@ def persist_uploaded_files(files: list[str], session_id: str) -> list[str]:
             continue
 
         base = _safe_upload_name(src_path)
+        inferred_ext = _infer_upload_extension(src_path)
+        if inferred_ext and os.path.splitext(base)[1].lower() not in IMAGE_EXTENSIONS | VIDEO_EXTENSIONS:
+            base = f"{base}{inferred_ext}"
         stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
         dest = os.path.join(dest_dir, f"{stamp}-{uuid.uuid4().hex[:8]}-{base}")
         shutil.copy2(src_path, dest)
@@ -1091,6 +1196,11 @@ def native_file_kind(path: str) -> str | None:
     if ext in IMAGE_EXTENSIONS:
         return "image"
     if ext in VIDEO_EXTENSIONS:
+        return "video"
+    inferred_ext = _infer_upload_extension(path)
+    if inferred_ext in IMAGE_EXTENSIONS:
+        return "image"
+    if inferred_ext in VIDEO_EXTENSIONS:
         return "video"
     return None
 

@@ -1302,6 +1302,20 @@ def native_remove_last_turn(chat_messages, app_cfg):
     return last_turn, chat_messages, app_cfg
 
 
+def model_call_status_message(variant: str) -> str:
+    if variant in MODELS:
+        return "⏳ Processing…"
+    if variant == "thinking":
+        return (
+            "⏳ Allocating ZeroGPU and loading the Thinking model for the first time. "
+            "This request may take longer; please wait…"
+        )
+    return (
+        "⏳ Allocating ZeroGPU and loading the model for the first time. "
+        "This request may take longer; please wait…"
+    )
+
+
 def native_chat_respond(user_input, chat_messages, app_cfg,
                         params_form, thinking_mode, streaming_mode,
                         max_new_tokens, temperature, top_p, top_k, max_frames,
@@ -1320,16 +1334,6 @@ def native_chat_respond(user_input, chat_messages, app_cfg,
         yield gr.update(), chat_messages, app_cfg, gr.update(visible=False)
         return
 
-    chat_messages = list(chat_messages or [])
-    display_start = len(chat_messages)
-    chat_messages.extend(native_display_user_messages(text, files))
-    assistant_index = len(chat_messages)
-    chat_messages.append({"role": "assistant", "content": "⏳ Processing…"})
-    yield native_empty_input(), chat_messages, app_cfg, gr.update(visible=True)
-
-    ctx = app_cfg.get("ctx", [])
-    messages = [{"role": item["role"], "content": copy.copy(item["content"])} for item in ctx]
-    messages.append({"role": "user", "content": user_content})
     sampling = (params_form == "Sampling")
     if not sampling:
         streaming_mode = False
@@ -1337,6 +1341,17 @@ def native_chat_respond(user_input, chat_messages, app_cfg,
     variant = pick_variant(use_thinking)
     enable_thinking = use_thinking and variant == "thinking"
     app_cfg["current_variant"] = variant
+
+    chat_messages = list(chat_messages or [])
+    display_start = len(chat_messages)
+    chat_messages.extend(native_display_user_messages(text, files))
+    assistant_index = len(chat_messages)
+    chat_messages.append({"role": "assistant", "content": model_call_status_message(variant)})
+    yield native_empty_input(), chat_messages, app_cfg, gr.update(visible=True)
+
+    ctx = app_cfg.get("ctx", [])
+    messages = [{"role": item["role"], "content": copy.copy(item["content"])} for item in ctx]
+    messages.append({"role": "user", "content": user_content})
     print(f"[native] respond variant={variant} enable_thinking={enable_thinking}", flush=True)
 
     try:
@@ -1464,16 +1479,6 @@ def native_fewshot_respond(_image, _user_message, _chat_messages, _app_cfg,
         yield _image, _user_message, "", _chat_messages, _app_cfg, gr.update(visible=False)
         return
 
-    _chat_messages = list(_chat_messages or [])
-    display_start = len(_chat_messages)
-    _chat_messages.extend(native_display_user_messages(_user_message or "", files))
-    assistant_index = len(_chat_messages)
-    _chat_messages.append({"role": "assistant", "content": "⏳ Processing…"})
-    yield None, "", "", _chat_messages, _app_cfg, gr.update(visible=True)
-
-    ctx = list(_app_cfg.get("ctx", []))
-    messages = [{"role": item["role"], "content": copy.copy(item["content"])} for item in ctx]
-    messages.append({"role": "user", "content": user_content})
     sampling = (params_form == "Sampling")
     if not sampling:
         streaming_mode = False
@@ -1481,6 +1486,17 @@ def native_fewshot_respond(_image, _user_message, _chat_messages, _app_cfg,
     variant = pick_variant(use_thinking)
     enable_thinking = use_thinking and variant == "thinking"
     _app_cfg["current_variant"] = variant
+
+    _chat_messages = list(_chat_messages or [])
+    display_start = len(_chat_messages)
+    _chat_messages.extend(native_display_user_messages(_user_message or "", files))
+    assistant_index = len(_chat_messages)
+    _chat_messages.append({"role": "assistant", "content": model_call_status_message(variant)})
+    yield None, "", "", _chat_messages, _app_cfg, gr.update(visible=True)
+
+    ctx = list(_app_cfg.get("ctx", []))
+    messages = [{"role": item["role"], "content": copy.copy(item["content"])} for item in ctx]
+    messages.append({"role": "user", "content": user_content})
     print(f"[native] fewshot variant={variant} enable_thinking={enable_thinking}", flush=True)
 
     try:
@@ -1601,7 +1617,18 @@ def native_clear_all(txt_message, chat_messages, app_session):
 def native_on_thinking_toggle(thinking_mode, chat_messages, app_session):
     target_variant = pick_variant(bool(thinking_mode))
     if target_variant != app_session.get("current_variant"):
-        gr.Info(f"Switched to '{target_variant}' model, history cleared.")
+        if target_variant == "thinking" and target_variant not in MODELS:
+            gr.Info(
+                "Switched to Thinking mode and cleared history. "
+                "The Thinking model will load on your next request, so the first response may take longer."
+            )
+        elif target_variant not in MODELS:
+            gr.Info(
+                f"Switched to '{target_variant}' model and cleared history. "
+                "The model will load on your next request, so the first response may take longer."
+            )
+        else:
+            gr.Info(f"Switched to '{target_variant}' model, history cleared.")
     app_session["current_variant"] = target_variant
     return native_clear_all(None, chat_messages, app_session)
 

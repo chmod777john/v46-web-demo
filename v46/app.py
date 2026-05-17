@@ -1307,11 +1307,11 @@ def model_call_status_message(variant: str) -> str:
     if variant == "thinking":
         return (
             "⏳ Loading the Thinking model. "
-            "This request may take longer; please wait…"
+            "Please wait…"
         )
     return (
         "⏳ Loading the model. "
-        "This request may take longer; please wait…"
+        "Please wait…"
     )
 
 

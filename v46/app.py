@@ -1099,7 +1099,6 @@ def on_thinking_toggle(thinking_mode, chat_bot, app_session):
         return gr.update(), gr.update(), app_session, \
                gr.update(), gr.update(), gr.update()
 
-    gr.Info(f"Switched to '{new_variant}' model, history cleared.")
     app_session["ctx"] = []
     app_session["images_cnt"] = 0
     app_session["videos_cnt"] = 0
@@ -1307,11 +1306,11 @@ def model_call_status_message(variant: str) -> str:
         return "⏳ Processing…"
     if variant == "thinking":
         return (
-            "⏳ Allocating ZeroGPU and loading the Thinking model for the first time. "
+            "⏳ Loading the Thinking model for the first time. "
             "This request may take longer; please wait…"
         )
     return (
-        "⏳ Allocating ZeroGPU and loading the model for the first time. "
+        "⏳ Loading the model for the first time. "
         "This request may take longer; please wait…"
     )
 
@@ -1616,19 +1615,6 @@ def native_clear_all(txt_message, chat_messages, app_session):
 
 def native_on_thinking_toggle(thinking_mode, chat_messages, app_session):
     target_variant = pick_variant(bool(thinking_mode))
-    if target_variant != app_session.get("current_variant"):
-        if target_variant == "thinking" and target_variant not in MODELS:
-            gr.Info(
-                "Switched to Thinking mode and cleared history. "
-                "The Thinking model will load on your next request, so the first response may take longer."
-            )
-        elif target_variant not in MODELS:
-            gr.Info(
-                f"Switched to '{target_variant}' model and cleared history. "
-                "The model will load on your next request, so the first response may take longer."
-            )
-        else:
-            gr.Info(f"Switched to '{target_variant}' model, history cleared.")
     app_session["current_variant"] = target_variant
     return native_clear_all(None, chat_messages, app_session)
 
@@ -1805,6 +1791,7 @@ def build_ui(model_display_name: str, default_thinking: bool):
                                  params_form, thinking_mode, streaming_mode,
                                  max_new_tokens, temperature, top_p, top_k, max_frames],
                                 [txt_message, chat_bot, app_session, stop_btn],
+                                show_progress="hidden",
                             )
 
                         with gr.Tab("Few Shot") as fewshot_tab:
@@ -1836,6 +1823,7 @@ def build_ui(model_display_name: str, default_thinking: bool):
                                  chat_bot, app_session],
                                 [image_input, user_message, assistant_message,
                                  chat_bot, app_session],
+                                show_progress="hidden",
                             )
                             generate_btn.click(
                                 native_fewshot_respond,
@@ -1844,6 +1832,7 @@ def build_ui(model_display_name: str, default_thinking: bool):
                                  max_new_tokens, temperature, top_p, top_k, max_frames],
                                 [image_input, user_message, assistant_message,
                                  chat_bot, app_session, stop_btn],
+                                show_progress="hidden",
                             )
 
                         # Tab switch events: remember current tab + clear state
@@ -1880,6 +1869,7 @@ def build_ui(model_display_name: str, default_thinking: bool):
                             inputs=[thinking_mode, chat_bot, app_session],
                             outputs=[txt_message, chat_bot, app_session,
                                      image_input, user_message, assistant_message],
+                            show_progress="hidden",
                         )
                         regenerate_btn.click(
                             native_regenerate_clicked,
@@ -1887,17 +1877,20 @@ def build_ui(model_display_name: str, default_thinking: bool):
                              params_form, thinking_mode, streaming_mode,
                              max_new_tokens, temperature, top_p, top_k, max_frames],
                             [txt_message, chat_bot, app_session, stop_btn],
+                            show_progress="hidden",
                         )
                         clear_btn.click(
                             native_clear_all,
                             [txt_message, chat_bot, app_session],
                             [txt_message, chat_bot, app_session,
                              image_input, user_message, assistant_message],
+                            show_progress="hidden",
                         )
                         stop_btn.click(
                             stop_clicked,
                             [app_session],
                             [app_session, stop_btn],
+                            show_progress="hidden",
                         )
 
             with gr.Tab("How to use"):
